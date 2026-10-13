@@ -78,6 +78,22 @@ describe('classifyUpstreamError', () => {
     expect(classifyUpstreamError(429, 'slow down')).toBe('soft_rate')
   })
 
+  // Measured 2026-10-13 on the live international deployment: an exhausted
+  // balance is a 429 whose body names it, not a 402. Read as a rate limit, the
+  // caller retries a terminal refusal instead of reporting the account state.
+  it('classifies an exhausted balance reported as 429 as hard credit', () => {
+    expect(classifyUpstreamError(429, '{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}'))
+      .toBe('hard_credit')
+    expect(classifyUpstreamError(429, '{"code":14018,"msg":"额度用尽"}')).toBe('hard_credit')
+  })
+
+  it('still classifies throttling reported as 429 as soft rate', () => {
+    expect(classifyUpstreamError(429, '{"code":14003,"msg":"too many requests"}')).toBe('soft_rate')
+    // Generic quota wording is the ambiguity a 429 must not resolve as an
+    // exhausted balance: throttling bodies say it too.
+    expect(classifyUpstreamError(429, '{"msg":"quota exceeded"}')).toBe('soft_rate')
+  })
+
   it('classifies 404 as transient not-found', () => {
     expect(classifyUpstreamError(404, '')).toBe('not_found')
   })

@@ -246,6 +246,24 @@ const HARD_CREDIT_MARKERS: readonly string[] = [
 ]
 
 /**
+ * Insufficient-credit markers precise enough to honour under a 429.
+ *
+ * The international deployment answers an exhausted balance with `429` carrying
+ * `{"code":14018,"msg":"Credits exhausted."}` — measured 2026-10-13 — so reading
+ * 429 as throttling alone parks a terminal refusal as a retryable rate limit.
+ *
+ * The generic quota phrases are deliberately absent: throttling bodies say
+ * "quota exceeded" too, and keeping that ambiguity away from 429 is exactly why
+ * {@link HARD_CREDIT_MARKERS} is not consulted there.
+ */
+const HARD_CREDIT_MARKERS_ON_429: readonly string[] = [
+  '14018',
+  'credit exhausted', 'credits exhausted', 'insufficient credit', 'no credit',
+  'out of credit', 'credit not enough', 'not enough credit', 'payment required',
+  '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '没有积分',
+]
+
+/**
  * Rate-limit markers that arrive without a 429 status.
  *
  * The upstream reports throttling in the body on 200/400/403 as well, so a
@@ -364,10 +382,12 @@ const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found
  *   the account, so it is checked first.
  * - Session death follows, because its marker appears in bodies that also carry
  *   other numbers.
- * - **429 comes before the credit phrase list.** A throttling body often also
- *   says "quota exceeded"; reading that as an exhausted balance parks a healthy
- *   account until the next billing day instead of retrying shortly. Testing the
- *   status first is what keeps the two apart.
+ * - **429 consults its own short list first.** A throttling body often also says
+ *   "quota exceeded", so the generic credit phrases are withheld from 429 and a
+ *   healthy account is not parked until the next billing day. But the deployment
+ *   also reports an exhausted balance as 429, and retrying that is just as
+ *   wrong: the unambiguous markers in {@link HARD_CREDIT_MARKERS_ON_429} are
+ *   honoured before it falls back to `soft_rate`.
  * - The phrase lists then catch what the status alone does not report.
  */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
@@ -376,7 +396,17 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
-  if (status === 429) return 'soft_rate'
+  if (status === 429) {
+    // Measured 2026-10-13: an exhausted balance arrives as
+    // `429 {"code":14018,"msg":"Credits exhausted."}`. Classified as throttling
+    // the caller retries a terminal refusal; only the unambiguous markers are
+    // honoured here, so a body that merely says "quota exceeded" stays a rate
+    // limit.
+    for (const marker of HARD_CREDIT_MARKERS_ON_429) {
+      if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
+    }
+    return 'soft_rate'
+  }
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
   }
@@ -774,36 +804,51 @@ export class WorkBuddyUpstreamClient {
     )
     let response: Response | undefined
     let lastFailure: { status: number; text: string } | undefined
-    try {
-      // The international realm routes chat through a console path first and
-      // answers 404/405 on the shared one; the CN realm serves only the shared
-      // path. Trying in order, and falling through only on a routing miss, keeps
-      // one code path correct for both.
-      for (const path of chatPaths(region)) {
-        const attempt = await fetch(`${chatBase(credential)}${path}`, {
+    // The international realm routes chat through a console path first and
+    // answers 404/405 on the shared one; the CN realm serves only the shared
+    // path. Trying in order, and falling through when the attempted path is
+    // unusable for a reason that does not apply to the other, keeps one code
+    // path correct for both.
+    for (const path of chatPaths(region)) {
+      let attempt: Response
+      try {
+        attempt = await fetch(`${chatBase(credential)}${path}`, {
           method: 'POST',
           headers: chatHeaders(credential, userAgent),
           body,
           ...signal === undefined ? {} : { signal },
         })
-        if (attempt.ok) {
-          response = attempt
-          break
+      } catch (error: unknown) {
+        // A transport failure on one spelling says nothing about the other —
+        // the console path has been observed refusing the TLS handshake while
+        // the shared path answered normally. A caller-initiated abort is the
+        // exception: that is the message being cancelled and must not be
+        // retried against the next path.
+        if (signal?.aborted === true) {
+          return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
         }
-        // A body can only be read once; capture it here so the failure still has
-        // its reason after a fallback attempt.
-        lastFailure = { status: attempt.status, text: (await attempt.text()).slice(0, ERROR_BODY_LIMIT) }
-        if (!pathFallbackStatus(attempt.status)) break
+        lastFailure = { status: 0, text: `transport error: ${String(error)}` }
+        continue
       }
-    } catch (error: unknown) {
-      return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+      if (attempt.ok) {
+        response = attempt
+        break
+      }
+      // A body can only be read once, so capture it here: the failure keeps its
+      // reason after a fallback attempt, and that excerpt decides the
+      // fall-through too — a 403 is retried only when it is an interception page
+      // rather than an API refusal.
+      const failureText = (await attempt.text()).slice(0, ERROR_BODY_LIMIT)
+      lastFailure = { status: attempt.status, text: failureText }
+      if (!pathFallbackStatus(attempt.status, failureText)) break
     }
     if (response !== undefined) return { ok: true, response }
     const failure = lastFailure ?? { status: 0, text: 'no chat endpoint answered' }
     return {
       ok: false,
       status: failure.status,
-      kind: classifyUpstreamError(failure.status, failure.text),
+      // Status 0 is a transport failure, not a client-side rejection.
+      kind: failure.status === 0 ? 'server' : classifyUpstreamError(failure.status, failure.text),
       message: failure.text,
     }
   }
@@ -1173,9 +1218,48 @@ function chatPaths(region: WorkBuddyRegion): readonly string[] {
   return region === 'global' ? [GLOBAL_CONSOLE_CHAT_PATH, CHAT_PATH] : [CHAT_PATH]
 }
 
-/** Whether a failed request should be retried on the next candidate path. */
-function pathFallbackStatus(status: number): boolean {
-  return status === 404 || status === 405
+/**
+ * Whether a 403 body is an interception page rather than an API refusal.
+ *
+ * A WAF block page is HTML (measured on the live deployment:
+ * `<html><title>WAF Block Page</title></html>`), while this API's own refusals
+ * are JSON envelopes. Retrying every 403 would double a permission failure that
+ * answers the same way on both spellings.
+ */
+function isInterceptionPage(body: string): boolean {
+  const head = body.slice(0, 2048).toLowerCase()
+  return head.includes('<html') || head.includes('<!doctype html')
+}
+
+/**
+ * Whether a failed request should be retried on the next candidate path.
+ *
+ * Deliberately narrow: a fall-through doubles the upstream request count for
+ * that message, so it is reserved for failures that mean "this spelling is
+ * unusable", never "this account or gateway is unhappy" — the sibling spelling
+ * answers those identically.
+ *
+ * - 404/405 — the route is not served here (the original condition).
+ * - 403 — measured WAF interception of the console path, and only when the body
+ *   is a block page; a JSON 403 is left alone.
+ *
+ * `body` is the failure excerpt for callers that have already read it. The
+ * billing meter does not read one (its `readEnvelope` needs the untouched
+ * response and its fall-through is a routing miss by design), so passing nothing
+ * keeps it on 404/405 alone.
+ *
+ * 429 is excluded on evidence: measured 2026-10-13, the international
+ * deployment answers an exhausted balance with `HTTP 429` and
+ * `{"code":14018,"msg":"Credits exhausted."}`, not 402. Falling through on 429
+ * would therefore spend a second request on an account-level refusal, and push
+ * a genuinely throttled account harder. 401/402 stay excluded for the same
+ * account-level reason; 5xx stays excluded because a gateway fault is shared by
+ * both spellings.
+ */
+function pathFallbackStatus(status: number, body?: string): boolean {
+  if (status === 404 || status === 405) return true
+  if (status === 403 && body !== undefined) return isInterceptionPage(body)
+  return false
 }
 
 /**

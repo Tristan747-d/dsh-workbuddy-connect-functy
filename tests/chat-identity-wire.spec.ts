@@ -156,6 +156,121 @@ describe('chatStream identity', () => {
     expect(result.ok).toBe(false)
     expect(calls).toEqual(['https://copilot.tencent.com/v2/chat/completions'])
   })
+
+  // Measured against the live international deployment (2026-10-13): the console
+  // path answered a Tencent WAF block page — HTML, while this API's own refusals
+  // are JSON — and the shared path answered 200 for the same credential and
+  // body. Only that interception shape falls through. A 403 that is a real API
+  // refusal answers identically on both spellings, and so do a 429, a 5xx and an
+  // exhausted balance; retrying those would only double the request count.
+  it('falls back to the shared chat path when the console path is WAF-blocked', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      calls.push(url)
+      return url.includes('/console/chat/completions')
+        ? fakeResponse('<html><title>WAF Block Page</title></html>', false, 403)
+        : fakeResponse('{}', true, 200)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(true)
+    expect(calls).toEqual([
+      'https://www.workbuddy.ai/console/chat/completions',
+      'https://www.workbuddy.ai/v2/chat/completions',
+    ])
+  })
+
+  it('does not retry a JSON 403 that is not an interception page', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      calls.push(String(input))
+      return fakeResponse('{"code":14003,"msg":"forbidden"}', false, 403)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(false)
+    expect(calls).toEqual(['https://www.workbuddy.ai/console/chat/completions'])
+  })
+
+  // Measured: the live deployment answers an exhausted balance with 429 and
+  // `14018 Credits exhausted`, not 402 — so a 429 fall-through would spend a
+  // second request on an account-level refusal.
+  it('does not retry the sibling path when the account is throttled or out of credit', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      calls.push(String(input))
+      return fakeResponse('{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}', false, 429)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(429)
+    expect(calls).toEqual(['https://www.workbuddy.ai/console/chat/completions'])
+  })
+
+  it('does not retry the sibling path on a server fault', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      calls.push(String(input))
+      return fakeResponse('{"code":500,"msg":"internal"}', false, 500)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(false)
+    expect(calls).toEqual(['https://www.workbuddy.ai/console/chat/completions'])
+  })
+
+  it('falls back to the shared chat path when the console path fails at the transport', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('/console/chat/completions')) throw new TypeError('fetch failed')
+      return fakeResponse('{}', true, 200)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(true)
+    expect(calls).toHaveLength(2)
+  })
+
+  it('reports a transport failure as a server fault, not a client rejection', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(0)
+    expect(result.kind).toBe('server')
+  })
+
+  // A dead session and an exhausted balance are properties of the account, so
+  // they read identically on both paths; retrying them only doubles the load.
+  it('does not retry the sibling path on an exhausted balance', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      calls.push(String(input))
+      return fakeResponse('{"code":14018,"msg":"Credits exhausted."}', false, 402)
+    }))
+    const result = await client().chatStream(GLOBAL, JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.kind).toBe('hard_credit')
+    expect(calls).toEqual(['https://www.workbuddy.ai/console/chat/completions'])
+  })
+
+  it('stops at the first path when the caller aborts the message', async () => {
+    const controller = new AbortController()
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      calls.push(String(input))
+      controller.abort()
+      throw new DOMException('The operation was aborted.', 'AbortError')
+    }))
+    const result = await client().chatStream(
+      GLOBAL,
+      JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+      controller.signal,
+    )
+    expect(result.ok).toBe(false)
+    expect(calls).toEqual(['https://www.workbuddy.ai/console/chat/completions'])
+  })
 })
 
 describe('probeEffort identity', () => {

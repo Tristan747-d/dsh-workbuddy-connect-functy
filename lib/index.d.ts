@@ -422,10 +422,12 @@ declare function normalizeCredits(credits: string | undefined): string | undefin
  *   the account, so it is checked first.
  * - Session death follows, because its marker appears in bodies that also carry
  *   other numbers.
- * - **429 comes before the credit phrase list.** A throttling body often also
- *   says "quota exceeded"; reading that as an exhausted balance parks a healthy
- *   account until the next billing day instead of retrying shortly. Testing the
- *   status first is what keeps the two apart.
+ * - **429 consults its own short list first.** A throttling body often also says
+ *   "quota exceeded", so the generic credit phrases are withheld from 429 and a
+ *   healthy account is not parked until the next billing day. But the deployment
+ *   also reports an exhausted balance as 429, and retrying that is just as
+ *   wrong: the unambiguous markers in {@link HARD_CREDIT_MARKERS_ON_429} are
+ *   honoured before it falls back to `soft_rate`.
  * - The phrase lists then catch what the status alone does not report.
  */
 declare function classifyUpstreamError(status: number, body: string): UpstreamErrorKind;
