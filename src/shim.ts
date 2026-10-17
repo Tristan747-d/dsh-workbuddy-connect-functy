@@ -211,7 +211,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     }
 
     const raw = (await readBody(req)).toString('utf8')
-    const prepared = prepareChatBody(raw)
+    // Resolve the model's own default reasoning level so the "Default" level
+    // (which pi-ai spells `off`) goes on the wire as that declared value.
+    let defaultEffort: string | undefined
+    try {
+      const parsed = JSON.parse(raw) as { model?: unknown }
+      const modelId = typeof parsed.model === 'string' ? parsed.model : undefined
+      if (modelId !== undefined) {
+        defaultEffort = catalog.current().find((entry) => entry.id === modelId)?.reasoning?.defaultEffort
+      }
+    } catch { /* malformed body: prepareChatBody reports it as-is */ }
+    const prepared = prepareChatBody(raw, defaultEffort === undefined ? undefined : { defaultEffort })
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())

@@ -20,6 +20,35 @@ import type { WorkBuddyWebCatalog, WorkBuddyWebModelBadge, WorkBuddyWebProbeSect
 export { WORKBUDDY_STATUS_PATH } from './status-paths.ts'
 export type { WorkBuddyWebStatus } from './status-paths.ts'
 
+/**
+ * How long a fetched credit snapshot is reused.
+ *
+ * The billing endpoint is a live upstream call: its own timeout is 30s and the
+ * international realm tries two candidate paths, so doing it on every card open
+ * made the panel sit on "正在读取账号…" for tens of seconds. One snapshot per
+ * minute is enough for a card that also offers a manual refresh.
+ */
+const CREDITS_CACHE_MS = 60_000
+
+/** How long the status route waits for a fresh snapshot before answering without it. */
+const CREDITS_WAIT_MS = 5_000
+
+type CreditSnapshot = Awaited<ReturnType<WorkBuddyUpstreamClient['fetchCredits']>>
+
+/** Last successful snapshot per account uid; the entry ages out after {@link CREDITS_CACHE_MS}. */
+const creditCache = new Map<string, { at: number; value: CreditSnapshot }>()
+
+/**
+ * Resolve to `undefined` after `ms`. A cold billing lookup must not hold the
+ * whole panel hostage; the request keeps running and lands in the cache.
+ */
+function timeoutAfter(ms: number): Promise<undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { resolve(undefined) }, ms)
+    timer.unref()
+  })
+}
+
 /** Constructor dependencies. */
 export interface WorkBuddyStatusRouteOptions {
   store: WorkBuddyCredentialStore
@@ -210,11 +239,25 @@ export async function workBuddyWebStatus(
   try {
     const credential = await deps.store.current()
     if (credential !== undefined) {
-      const credits = await deps.client.fetchCredits(credential)
-      // `unlimited` and `cycleResetTime` ride along as-is: the card must see
-      // "no cap" as its own state, and the fetch only sets them when the
-      // upstream actually reported them.
-      return { ...probed, credits }
+      const cached = creditCache.get(credential.uid)
+      if (cached !== undefined && Date.now() - cached.at < CREDITS_CACHE_MS) {
+        // `unlimited` and `cycleResetTime` ride along as-is: the card must see
+        // "no cap" as its own state, and the fetch only sets them when the
+        // upstream actually reported them.
+        return { ...probed, credits: cached.value }
+      }
+      // A cold or expired lookup answers within CREDITS_WAIT_MS: the upstream
+      // call keeps running and lands in the cache, so the next open is instant
+      // instead of blocking on the full 30s billing timeout again.
+      const pending = deps.client.fetchCredits(credential).then((value) => {
+        creditCache.set(credential.uid, { at: Date.now(), value })
+        return value
+      })
+      const credits = await Promise.race([pending, timeoutAfter(CREDITS_WAIT_MS)])
+      // Timed out: answer without the credit fields rather than reporting a
+      // failure the user cannot act on. The in-flight request still fills the
+      // cache, so reopening the card is instant.
+      return credits === undefined ? probed : { ...probed, credits }
     }
   } catch (error: unknown) {
     return { ...probed, creditsError: safeMessage(error) }

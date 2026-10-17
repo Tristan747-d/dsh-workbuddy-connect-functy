@@ -437,8 +437,9 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream: force
  * `stream: true` (the upstream rejects non-streaming), translate the
  * `max_completion_tokens` alias, default `stream_options`, flatten `tool_choice`
- * (the upstream's field is a string; object forms return 400), and rewrite
- * `developer` messages as `system`.
+ * (the upstream's field is a string; object forms return 400), rewrite
+ * `developer` messages as `system`, and drop the provider-default reasoning
+ * levels.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
@@ -446,7 +447,9 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
  */
-declare function prepareChatBody(source: string): string;
+declare function prepareChatBody(source: string, options?: {
+  defaultEffort?: string;
+}): string;
 /** Provenance of one successful catalog fetch, surfaced by the status card. */
 interface WorkBuddyCatalogFetch {
   fetchedAtMs: number;

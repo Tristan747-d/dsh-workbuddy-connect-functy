@@ -202,8 +202,12 @@ export function reasoningFields(
     return { reasoning: false }
   }
   const map: Record<ModelThinkingLevel, string | null> = {
-    // Probing never grants `off`; only an explicit declaration does.
-    off: reasoning.canDisableThinking === true && declared !== undefined && declared.length > 0 ? 'off' : null,
+    // DSH renders this level as "Default", so it must mean "no reasoning_effort
+    // on the wire" — and the upstream has no `off` spelling to send anyway
+    // (measured: HTTP 400 / code 11133). `canDisableThinking` describes the
+    // upstream's capability, not a wire value this client can spell, so the
+    // level maps to null and the request carries the model's own default.
+    off: null,
     // `minimal` is not in the upstream effort vocabulary (EFFORT_VALUES), so
     // no declared set — and no probe candidate — can ever contain it.
     minimal: null,

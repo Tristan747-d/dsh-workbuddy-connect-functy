@@ -587,11 +587,40 @@ function billingHeaders(credential: WorkBuddyCredential): Record<string, string>
 }
 
 /**
+ * Normalize `reasoning_effort` to the upstream's vocabulary.
+ *
+ * The WorkBuddy upstream validates the field against a fixed set and rejects
+ * everything else with HTTP 400 / code 11133 ("the request parameters were
+ * rejected by the model provider"). Measured against the live endpoint:
+ * `minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`none` are accepted.
+ *
+ * The rejected spellings all mean "no explicit choice":
+ *
+ * - `off` — what pi-ai hard-codes when DSH renders its "Default" level. pi-ai
+ *   ignores `thinkingLevelMap.off`, so this layer is the only place it can be
+ *   corrected.
+ * - `disabled` — same shape.
+ * - `default` / `auto` — literally "whatever the provider defaults to".
+ *
+ * They are replaced with the catalog's own `defaultEffort` for that model, so
+ * "Default" goes on the wire as the level the upstream itself declares as its
+ * default. Only when the catalog carries no `defaultEffort` is the field
+ * dropped, which leaves the choice to the upstream.
+ */
+function normalizeReasoningEffort(obj: Record<string, unknown>, defaultEffort?: string): void {
+  const effort = obj['reasoning_effort']
+  if (effort !== 'default' && effort !== 'auto' && effort !== 'off' && effort !== 'disabled') return
+  if (typeof defaultEffort === 'string' && defaultEffort.length > 0) obj['reasoning_effort'] = defaultEffort
+  else delete obj['reasoning_effort']
+}
+
+/**
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream: force
  * `stream: true` (the upstream rejects non-streaming), translate the
  * `max_completion_tokens` alias, default `stream_options`, flatten `tool_choice`
- * (the upstream's field is a string; object forms return 400), and rewrite
- * `developer` messages as `system`.
+ * (the upstream's field is a string; object forms return 400), rewrite
+ * `developer` messages as `system`, and drop the provider-default reasoning
+ * levels.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
@@ -599,7 +628,7 @@ function billingHeaders(credential: WorkBuddyCredential): Record<string, string>
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
  */
-export function prepareChatBody(source: string): string {
+export function prepareChatBody(source: string, options?: { defaultEffort?: string }): string {
   let body: unknown
   try {
     body = JSON.parse(source)
@@ -616,6 +645,13 @@ export function prepareChatBody(source: string): string {
   if (!('stream_options' in obj)) obj['stream_options'] = { include_usage: true }
   normalizeDeveloperRole(obj)
   normalizeToolChoice(obj)
+  normalizeReasoningEffort(obj, options?.defaultEffort)
+  // pi-ai 1.3.0 (shipped with DSH 0.2.1) sets `store: false` on every OpenAI
+  // chat call. That is an OpenAI-only field: the WorkBuddy upstream rejects the
+  // whole request with HTTP 400 / code 11133 ("the request parameters were
+  // rejected by the model provider"). Neither the official client nor this
+  // plugin's own probe calls ever send it, so drop it before forwarding.
+  delete obj['store']
   return JSON.stringify(obj)
 }
 
