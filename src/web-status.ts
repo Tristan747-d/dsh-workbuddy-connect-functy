@@ -35,8 +35,22 @@ const CREDITS_WAIT_MS = 5_000
 
 type CreditSnapshot = Awaited<ReturnType<WorkBuddyUpstreamClient['fetchCredits']>>
 
-/** Last successful snapshot per account uid; the entry ages out after {@link CREDITS_CACHE_MS}. */
+/**
+ * Last successful snapshot per account **and variant**; the entry ages out
+ * after {@link CREDITS_CACHE_MS}.
+ *
+ * The key carries the variant's own status path, not the uid alone: the CN and
+ * international products draw their balances from different deployments, and a
+ * sign-in that happens to share a uid across the two would otherwise let the
+ * first card answer with the other's credits (measured: `dual-routes` served
+ * the CN balance on the international route).
+ */
 const creditCache = new Map<string, { at: number; value: CreditSnapshot }>()
+
+/** Cache key for one account's snapshot within one variant's route. */
+function creditCacheKey(deps: WorkBuddyStatusRouteOptions, uid: string): string {
+  return `${deps.path ?? WORKBUDDY_STATUS_PATH}\u0000${uid}`
+}
 
 /**
  * Resolve to `undefined` after `ms`. A cold billing lookup must not hold the
@@ -239,7 +253,8 @@ export async function workBuddyWebStatus(
   try {
     const credential = await deps.store.current()
     if (credential !== undefined) {
-      const cached = creditCache.get(credential.uid)
+      const cacheKey = creditCacheKey(deps, credential.uid)
+      const cached = creditCache.get(cacheKey)
       if (cached !== undefined && Date.now() - cached.at < CREDITS_CACHE_MS) {
         // `unlimited` and `cycleResetTime` ride along as-is: the card must see
         // "no cap" as its own state, and the fetch only sets them when the
@@ -250,7 +265,7 @@ export async function workBuddyWebStatus(
       // call keeps running and lands in the cache, so the next open is instant
       // instead of blocking on the full 30s billing timeout again.
       const pending = deps.client.fetchCredits(credential).then((value) => {
-        creditCache.set(credential.uid, { at: Date.now(), value })
+        creditCache.set(cacheKey, { at: Date.now(), value })
         return value
       })
       const credits = await Promise.race([pending, timeoutAfter(CREDITS_WAIT_MS)])

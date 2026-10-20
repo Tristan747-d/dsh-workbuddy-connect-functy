@@ -7,7 +7,7 @@
  * @module dsh-workbuddy-connect/upstream
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { appUserAgent, resolveAppVersion, type AppVersionInfo } from './app-version.ts'
 import { chatUserAgent, fallbackChatIdentity, resolveChatIdentity, type ChatIdentity } from './client-identity.ts'
 import type { WorkBuddyCredential } from './auth.ts'
@@ -532,11 +532,200 @@ function chatHeaders(credential: WorkBuddyCredential, userAgent?: string): Recor
         },
     // Usage attribution: the upstream reports usage per client, and a request
     // carrying no client identity is recorded as an anonymous gateway call.
+    //
+    // `X-Agent-Type` is the one member of this family that is region-scoped:
+    // WorkBuddy's own client sends the shared pair on both builds and the
+    // type only on the international one, so claiming `main` on the CN
+    // deployment would name an identity that build does not have.
+    'X-Agent-Intent': 'craft',
     'X-Agent-Purpose': 'conversation',
+    ...international ? { 'X-Agent-Type': 'main' } : {},
     'X-IDE-Name': WORKBUDDY_CLIENT_NAME,
     'X-IDE-Type': WORKBUDDY_CLIENT_NAME,
     'X-IDE-Version': CLIENT_VERSION,
     'X-Product': WORKBUDDY_CLIENT_NAME,
+  }
+  return headers
+}
+
+/**
+ * Salt for the conversation/turn id derivation, fresh in each process.
+ *
+ * A derived id must not be readable as the text it came from, so it is hashed
+ * with a per-process salt: the same conversation names the same id for this
+ * run, and a restart starts a new namespace — which is what a fresh client
+ * would do too.
+ */
+const CONVERSATION_ID_SALT = randomBytes(16).toString('hex')
+
+/** A 32-hex-digit id in the shape WorkBuddy's own client emits. */
+function conversationIdHex(): string {
+  return randomBytes(16).toString('hex')
+}
+
+/** Derive a 32-hex id from what names the thing it identifies. */
+function derivedConversationId(kind: string, key: string): string {
+  return createHash('sha256').update(`${CONVERSATION_ID_SALT}|${kind}|${key}`).digest('hex').slice(0, 32)
+}
+
+/**
+ * A message content's signature: its text, plus a digest of every part that is
+ * not text (an image, a file), so a turn made of images alone is still a turn
+ * of its own.
+ */
+function messageSignature(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const part of content) {
+    if (typeof part !== 'object' || part === null) continue
+    const record = part as Record<string, unknown>
+    const type = typeof record['type'] === 'string' ? record['type'] : ''
+    if (type === '' || type === 'text') {
+      out += typeof record['text'] === 'string' ? record['text'] : ''
+    } else {
+      out += `[${type}:${createHash('sha256').update(JSON.stringify(part)).digest('hex').slice(0, 8)}]`
+    }
+  }
+  return out
+}
+
+/**
+ * Whether `messages[i]` answers the message before it — a tool's result, or an
+ * assistant's calls — rather than carrying the user's own words.
+ */
+function answeredBefore(messages: readonly unknown[], i: number): boolean {
+  const prev = messages[i - 1]
+  if (typeof prev !== 'object' || prev === null) return false
+  const record = prev as Record<string, unknown>
+  if (record['role'] === 'tool') return true
+  return record['role'] === 'assistant' && Array.isArray(record['tool_calls']) && record['tool_calls'].length > 0
+}
+
+/**
+ * Whether a message's content is nothing but tool results.
+ *
+ * Anthropic-shaped clients carry a tool result inside a *user* message, so a
+ * body can end with several such messages in a row while the send is still
+ * one. Keying the turn on one of those would change the id with every step of
+ * a tool loop, which is the opposite of what a turn id is for.
+ */
+function isToolResultOnly(content: unknown): boolean {
+  if (!Array.isArray(content) || content.length === 0) return false
+  for (const part of content) {
+    if (typeof part !== 'object' || part === null) return false
+    const type = (part as Record<string, unknown>)['type']
+    if (type !== 'tool_result' && type !== 'tool-result') return false
+  }
+  return true
+}
+
+/**
+ * Name the user send a chat answers: the body's last user message that is the
+ * user's own, by its place and its signature.
+ *
+ * Every step of one send — a tool call answered and sent again, or the sibling
+ * chat path answering after a routing miss — repeats it, while the user's next
+ * message changes it. That is what `X-Conversation-Request-ID` means upstream:
+ * the backend counts one user send as one request by this id, so a chat that
+ * carried a fresh id per step would show up in the usage detail as many
+ * requests.
+ *
+ * `''` when there is no signable user message, which tells the caller to use a
+ * per-request id instead of inventing a turn.
+ */
+function turnKeyOf(body: Record<string, unknown> | undefined): string {
+  const messages = Array.isArray(body?.['messages']) ? body['messages'] as unknown[] : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (typeof message !== 'object' || message === null) continue
+    const record = message as Record<string, unknown>
+    if (record['role'] !== 'user' || answeredBefore(messages, i)) continue
+    if (isToolResultOnly(record['content'])) continue
+    const signature = messageSignature(record['content'])
+    return signature === '' ? '' : `u${i}:${signature}`
+  }
+  return ''
+}
+
+/**
+ * Name the conversation a chat belongs to, from its first user message.
+ *
+ * Nothing in the current wiring hands this client a harness session id — the
+ * adapter configures no affinity header, so the shim receives none — so the
+ * opening user message is the only session-scoped fact available. It is stable
+ * for the whole conversation, which is what the id is for.
+ *
+ * `''` names nothing (a body with no user message), and no conversation id is
+ * claimed then: a made-up one would be a conversation of the request's own.
+ */
+function conversationKeyOf(body: Record<string, unknown> | undefined): string {
+  const messages = Array.isArray(body?.['messages']) ? body['messages'] as unknown[] : []
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null) continue
+    const record = message as Record<string, unknown>
+    if (record['role'] !== 'user') continue
+    const signature = messageSignature(record['content'])
+    if (signature !== '') return `first:${signature}`
+  }
+  return ''
+}
+
+/**
+ * Attach the conversation-tracking header family to a chat request.
+ *
+ * The gateway's channel verification is an **independent, separately switched**
+ * check, not a property of the request: measured 2026-10-20 12:2x (+08:00) on
+ * both live deployments with this plugin's own credential, a well-formed chat
+ * carrying only {@link chatHeaders}' family was answered 200 on the CN
+ * deployment and 200 on the international one — while the same account, with
+ * the leading system message stripped, was refused `400 / 11128
+ * "first message is not system prompt"`. The gate therefore exists and is
+ * armed, but its conversation-header arm was not switched on for this account.
+ *
+ * Other deployments have it switched on: since 2026-10-15 the international
+ * gateway refuses chats that lack this family with `400 / code 11128 /
+ * "request illegal"` (「请求被拦截，请重新发送」), measured independently by
+ * `decolua/9router` (#5005), `XDTrees/dsh-xdpool` (#58) and
+ * `mmqz/cpa-multi-plugins` (#43/#44), with the same shape of A/B: the same
+ * body, same credential, 400 without the family and 200 with it. It is also
+ * reported to spread by deployment and by time of day rather than by request
+ * shape, which is why a short single-turn message can succeed while a long
+ * tool loop fails minutes later — and why a header-only patch is not a
+ * guarantee on an account where a further gate is armed (#490: three headers
+ * present, still 400).
+ *
+ * The body is the **prepared** text actually sent, so the ids name what went
+ * out on the wire. An id the caller already carried is kept for all four: its
+ * own attribution is better information than a derivation made here.
+ */
+export function withGatewayChatHeaders(
+  headers: Record<string, string>,
+  preparedBody: string,
+): Record<string, string> {
+  let body: Record<string, unknown> | undefined
+  try {
+    const parsed: unknown = JSON.parse(preparedBody)
+    body = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined
+  } catch {
+    // A body whose shape cannot be read still has to be attributable.
+    body = undefined
+  }
+  const messageId = conversationIdHex()
+  if (headers['X-Conversation-Message-ID'] === undefined) headers['X-Conversation-Message-ID'] = messageId
+  // The official client has these two be one value.
+  if (headers['X-Request-ID'] === undefined) headers['X-Request-ID'] = headers['X-Conversation-Message-ID']
+  const turn = turnKeyOf(body)
+  if (headers['X-Conversation-Request-ID'] === undefined) {
+    headers['X-Conversation-Request-ID'] = turn === ''
+      ? conversationIdHex()
+      : derivedConversationId('turn', turn)
+  }
+  const conversation = conversationKeyOf(body)
+  if (conversation !== '' && headers['X-Conversation-ID'] === undefined) {
+    headers['X-Conversation-ID'] = derivedConversationId('conversation', conversation)
   }
   return headers
 }
@@ -838,6 +1027,10 @@ export class WorkBuddyUpstreamClient {
       region === 'global' ? prepareInternationalChatBody(bodyJson) : bodyJson,
       credential.uid,
     )
+    // Built once from the prepared body and reused across the path fallback: a
+    // sibling path retrying the same send is the same request, so its message
+    // and turn ids must not rotate.
+    const headers = withGatewayChatHeaders(chatHeaders(credential, userAgent), body)
     let response: Response | undefined
     let lastFailure: { status: number; text: string } | undefined
     // The international realm routes chat through a console path first and
@@ -850,7 +1043,7 @@ export class WorkBuddyUpstreamClient {
       try {
         attempt = await fetch(`${chatBase(credential)}${path}`, {
           method: 'POST',
-          headers: chatHeaders(credential, userAgent),
+          headers,
           body,
           ...signal === undefined ? {} : { signal },
         })
@@ -1221,10 +1414,16 @@ export class WorkBuddyUpstreamClient {
 
     let response: Response
     try {
+      // The probe shares the chat path's gateway headers on purpose: a probe
+      // that passes while a real message would be refused measures nothing.
+      const probeBody = JSON.stringify(payload)
       response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
-        headers: { ...chatHeaders(credential, userAgent), 'Authorization': `Bearer ${credential.accessToken}` },
-        body: JSON.stringify(payload),
+        headers: withGatewayChatHeaders(
+          { ...chatHeaders(credential, userAgent), 'Authorization': `Bearer ${credential.accessToken}` },
+          probeBody,
+        ),
+        body: probeBody,
         signal,
       })
     } catch (error: unknown) {

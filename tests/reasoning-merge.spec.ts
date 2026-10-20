@@ -175,7 +175,10 @@ describe('probe results merged into the provider', () => {
     // replaces the declared set — not which values upstream declares this week.
     const info = WorkBuddy.FALLBACK_WORKBUDDY_MODELS.find(model => model.id === 'glm-5.3')
     const declared = [...(info?.reasoning?.supportedEfforts ?? [])].sort()
-    const expected = info?.reasoning?.canDisableThinking === true ? ['off', ...declared].sort() : declared
+    // The declared set is offered verbatim. `off` is never added, whatever
+    // `canDisableThinking` says: the upstream has no `off` spelling to send, so
+    // that level maps to null and the request carries the model's own default.
+    const expected = declared
     const efforts = await effortsFor(ctx, 'glm-5.3')
     expect(efforts).toEqual(expected)
     // `max` was in the fabricated observation; it appears only if declared.

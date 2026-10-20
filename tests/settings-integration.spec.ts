@@ -258,7 +258,11 @@ describe('WorkBuddy Host settings integration', () => {
     const autoResolved = await ctx.llm.resolveModelInfo('workbuddy', 'auto')
     expect(autoResolved.reasoning).toBeUndefined()
     const flashResolved = await ctx.llm.resolveModelInfo('workbuddy', 'glm-5.3-flash')
-    expect(flashResolved.reasoning?.efforts.map(effort => effort.id).sort()).toEqual(['high', 'low', 'max', 'off'])
+    // Exactly the declared set. `off` is not offered even though this model
+    // reports `canDisableThinking`: the upstream has no `off` spelling, so the
+    // level would put nothing on the wire and the request would silently carry
+    // the model's default instead of what the user picked.
+    expect(flashResolved.reasoning?.efforts.map(effort => effort.id).sort()).toEqual(['high', 'low', 'max'])
 
     // Image modalities follow the per-model catalog flag (fallback list here):
     // image-capable entries expose `image`, glm-5.1 stays text-only.
