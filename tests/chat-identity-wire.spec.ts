@@ -63,12 +63,13 @@ describe('chatStream identity', () => {
     expect(headers['Content-Type']).toBe('application/json')
     // Chat streams, so it declares the event-stream type the shared default does not.
     expect(headers['Accept']).toBe('application/json, text/event-stream')
-    // CN keeps the account's own declarations; this fixture has no enterprise,
-    // so the X-No-* convention states that explicitly.
+    // CN chat omits the billing domain and uses the explicit no-department
+    // convention; this avoids the unapproved-channel branch.
     expect(headers['X-User-Id']).toBe('uid-1')
     expect(headers['X-No-Enterprise-Id']).toBe('1')
     expect(headers['X-Enterprise-Id']).toBeUndefined()
-    expect(headers['X-Domain']).toBe('www.codebuddy.cn')
+    expect(headers['X-Domain']).toBeUndefined()
+    expect(headers['X-No-Department-Info']).toBe('1')
     expect(headers['Authorization']).toBe('Bearer at')
     // 安全红线：refresh token 绝不出现在 chat 请求里。
     expect(headers['X-Refresh-Token']).toBeUndefined()
@@ -77,10 +78,10 @@ describe('chatStream identity', () => {
     expect(headers['X-Product']).toBe('WorkBuddy')
     expect(headers['X-IDE-Name']).toBe('WorkBuddy')
     expect(headers['X-IDE-Version']).toBe('2.63.2')
-    // Device identifiers are derived from the uid, so they are stable and account-scoped.
-    expect(headers['X-Machine-ID']).toMatch(/^[0-9a-f]{36}$/)
-    expect(headers['X-Session-ID']).toMatch(/^[0-9a-f]{36}$/)
-    expect(headers['X-Machine-ID']).not.toBe(headers['X-Session-ID'])
+    // CN chat omits the derived device identifiers because this account's
+    // gateway rejects them as an unapproved channel.
+    expect(headers['X-Machine-ID']).toBeUndefined()
+    expect(headers['X-Session-ID']).toBeUndefined()
   })
 
   it('adds an account-scoped cache key to the body it forwards', async () => {

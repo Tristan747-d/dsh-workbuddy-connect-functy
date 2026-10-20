@@ -545,6 +545,15 @@ function chatHeaders(credential: WorkBuddyCredential, userAgent?: string): Recor
     'X-IDE-Version': CLIENT_VERSION,
     'X-Product': WORKBUDDY_CLIENT_NAME,
   }
+  if (!international) {
+    // The CN gateway accepts the WorkBuddy chat identity, but rejects the
+    // plugin's derived device fingerprint on some valid accounts.
+    delete headers['X-Machine-ID']
+    delete headers['X-Session-ID']
+    // The desktop CN client does not send the billing domain on chat.
+    delete headers['X-Domain']
+    headers['X-No-Department-Info'] = '1'
+  }
   return headers
 }
 
@@ -1031,6 +1040,7 @@ export class WorkBuddyUpstreamClient {
     // sibling path retrying the same send is the same request, so its message
     // and turn ids must not rotate.
     const headers = withGatewayChatHeaders(chatHeaders(credential, userAgent), body)
+    if (region === 'cn' || realmOf(credential) === 'cn') delete headers['X-Conversation-ID']
     let response: Response | undefined
     let lastFailure: { status: number; text: string } | undefined
     // The international realm routes chat through a console path first and

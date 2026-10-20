@@ -54,17 +54,18 @@ async function wire(credential: WorkBuddyCredential, body: string): Promise<Reco
 }
 
 describe('conversation tracking family on the wire', () => {
-  it('sends the four ids on both regions', async () => {
+  it('sends gateway ids, omitting the CN conversation id', async () => {
     for (const credential of [CN, GLOBAL]) {
       const headers = await wire(credential, TWO_TURNS)
       for (const name of [
-        'X-Conversation-ID',
         'X-Conversation-Request-ID',
         'X-Conversation-Message-ID',
         'X-Request-ID',
       ]) {
         expect(headers[name]).toMatch(HEX32)
       }
+      if (credential.domain.endsWith('workbuddy.ai')) expect(headers['X-Conversation-ID']).toMatch(HEX32)
+      else expect(headers['X-Conversation-ID']).toBeUndefined()
       // The official client has these two be one value.
       expect(headers['X-Request-ID']).toBe(headers['X-Conversation-Message-ID'])
     }
