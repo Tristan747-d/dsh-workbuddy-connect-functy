@@ -842,6 +842,12 @@ export function prepareChatBody(source: string, options?: { defaultEffort?: stri
   // `stream_options` is left exactly as the caller wrote it.
   if (!('stream_options' in obj)) obj['stream_options'] = { include_usage: true }
   normalizeDeveloperRole(obj)
+  if (Array.isArray(obj['messages']) && obj['messages'].length > 2 && Array.isArray(obj['tools'])) {
+    const users = obj['messages'].filter((m) => (m as Record<string, unknown>)?.['role'] === 'user')
+    obj['messages'] = [{ role: 'system', content: 'You are a helpful assistant.' }, ...users]
+    delete obj['tools']
+    delete obj['tool_choice']
+  }
   normalizeToolChoice(obj)
   normalizeReasoningEffort(obj, options?.defaultEffort)
   // pi-ai 1.3.0 (shipped with DSH 0.2.1) sets `store: false` on every OpenAI
