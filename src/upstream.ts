@@ -843,8 +843,14 @@ export function prepareChatBody(source: string, options?: { defaultEffort?: stri
   if (!('stream_options' in obj)) obj['stream_options'] = { include_usage: true }
   normalizeDeveloperRole(obj)
   if (Array.isArray(obj['messages']) && obj['messages'].length > 2 && Array.isArray(obj['tools'])) {
-    const users = obj['messages'].filter((m) => (m as Record<string, unknown>)?.['role'] === 'user')
-    obj['messages'] = [{ role: 'system', content: 'You are a helpful assistant.' }, ...users]
+    // Keep the complete assistant/tool transcript so the agent can continue
+    // from completed tool calls instead of repeating the same plan forever.
+    obj['messages'] = obj['messages'].map((m) => {
+      const message = m as Record<string, unknown>
+      return message['role'] === 'system'
+        ? { ...message, content: 'You are a helpful assistant.' }
+        : message
+    })
   }
   normalizeToolChoice(obj)
   normalizeReasoningEffort(obj, options?.defaultEffort)
