@@ -845,8 +845,6 @@ export function prepareChatBody(source: string, options?: { defaultEffort?: stri
   if (Array.isArray(obj['messages']) && obj['messages'].length > 2 && Array.isArray(obj['tools'])) {
     const users = obj['messages'].filter((m) => (m as Record<string, unknown>)?.['role'] === 'user')
     obj['messages'] = [{ role: 'system', content: 'You are a helpful assistant.' }, ...users]
-    delete obj['tools']
-    delete obj['tool_choice']
   }
   normalizeToolChoice(obj)
   normalizeReasoningEffort(obj, options?.defaultEffort)
