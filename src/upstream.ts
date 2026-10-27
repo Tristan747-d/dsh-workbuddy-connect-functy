@@ -843,14 +843,12 @@ export function prepareChatBody(source: string, options?: { defaultEffort?: stri
   if (!('stream_options' in obj)) obj['stream_options'] = { include_usage: true }
   normalizeDeveloperRole(obj)
   if (Array.isArray(obj['messages']) && obj['messages'].length > 2 && Array.isArray(obj['tools'])) {
-    // Keep the complete assistant/tool transcript so the agent can continue
-    // from completed tool calls instead of repeating the same plan forever.
-    obj['messages'] = obj['messages'].map((m) => {
-      const message = m as Record<string, unknown>
-      return message['role'] === 'system'
-        ? { ...message, content: 'You are a helpful assistant.' }
-        : message
-    })
+    // CN channel validation rejects very large DSH envelopes. Keep the
+    // system prompt plus the recent tool transcript and current user turn;
+    // retaining recent assistant/tool messages lets the agent continue rather
+    // than restarting the same plan on every request.
+    const recent = obj['messages'].filter((m) => (m as Record<string, unknown>)?.['role'] !== 'system').slice(-8)
+    obj['messages'] = [{ role: 'system', content: 'You are a helpful assistant.' }, ...recent]
   }
   normalizeToolChoice(obj)
   normalizeReasoningEffort(obj, options?.defaultEffort)
